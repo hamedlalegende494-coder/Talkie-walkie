@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Talkie-Walkie</title>
+<style>
+:root{--bg:#10141a;--card:#1b222c;--txt:#e8edf3;--mut:#8b97a6;--acc:#2ecc71;--red:#e74c3c}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif;display:flex;justify-content:center}
+main{width:100%;max-width:440px;padding:20px;display:flex;flex-direction:column;gap:14px}
+h1{text-align:center;margin:8px 0}
+section{background:var(--card);border-radius:16px;padding:18px;display:flex;flex-direction:column;gap:12px}
+input[type=text]{padding:14px;border-radius:10px;border:1px solid #2c3746;background:#0f141b;color:var(--txt);font-size:16px}
+button{padding:14px;border:0;border-radius:10px;font-size:16px;font-weight:600;background:#2d6cdf;color:#fff;cursor:pointer}
+button.alt{background:#3a4658}
+.sep{text-align:center;color:var(--mut)}
+#msg{color:var(--red);margin:0;min-height:1em;text-align:center}
+#chan{text-align:center;font-weight:700;font-size:18px;letter-spacing:1px}
+#status{text-align:center;color:var(--mut);min-height:1.4em}
+#list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+#list li{padding:10px 12px;border-radius:8px;background:#0f141b;display:flex;justify-content:space-between}
+#list li.talk{outline:2px solid var(--acc);background:#143323}
+#ptt{height:150px;border-radius:50%;width:150px;align-self:center;font-size:17px;background:#3a4658;user-select:none;touch-action:none}
+#ptt.on{background:var(--red);box-shadow:0 0 0 10px #e74c3c44}
+label{display:flex;gap:8px;align-items:center;justify-content:center;color:var(--mut)}
+#inbox{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
+#inbox li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;border-radius:8px;background:#0f141b;font-size:14px}
+#inbox button{padding:6px 14px;font-size:14px}
+details summary{cursor:pointer;color:var(--mut)}
+</style>
+</head>
+<body>
+<main>
+  <h1>📻 Talkie-Walkie</h1>
+
+  <section id="home">
+    <input type="text" id="name" placeholder="Votre nom">
+    <button id="btnHost">🛡️ Je suis le vigile (créer le canal)</button>
+    <div class="sep">— ou —</div>
+    <input type="text" id="code" placeholder="Code du canal" autocapitalize="characters">
+    <button class="alt" id="btnJoin">Rejoindre le canal</button>
+    <p id="msg"></p>
+  </section>
+
+  <section id="radio" hidden>
+    <div id="chan"></div>
+    <div id="status">Canal ouvert</div>
+    <ul id="list"></ul>
+    <details id="inboxBox"><summary id="inboxTitle">📨 Messages vocaux</summary><ul id="inbox"></ul></details>
+    <button id="ptt" oncontextmenu="return false">Maintenir pour parler</button>
+    <label><input type="checkbox" id="open"> Micro ouvert (mains libres)</label>
+  </section>
+  <audio id="player" autoplay playsinline></audio>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const PREFIX = 'tokiwoki-';
+let peer, mic, role, myName, talking = false, hostConn, ctx, micGain;
+const members = new Map(); // côté vigile : id -> {name, talking, call, conn, src, dest, audio}
+
+const err = t => { $('msg').textContent = t; };
+
+async function getMic() {
+  mic = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+  mic.getAudioTracks().forEach(t => t.enabled = (role === 'host')); // membre : coupé tant qu'on ne parle pas
+}
+
+function show() {
+  $('home').hidden = true; $('radio').hidden = false;
+  keepAwake();
+}
+async function keepAwake() { try { await navigator.wakeLock.request('screen'); } catch (e) {} }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !$('radio').hidden) keepAwake();
+});
+
+function renderRoster(list) {
+  $('list').innerHTML = list.map(m =>
+    `<li class="${m.talking ? 'talk' : ''}"><span>${m.name === myName ? '👤' : '🎧'} ${esc(m.name)}</span><span>${m.talking ? '🎙️' : ''}</span></li>`
+  ).join('');
+  const who = list.filter(m => m.talking).map(m => m.name);
+  $('status').textContent = who.length ? '🎙️ ' + who.join(', ') + ' parle…' : 'Canal libre';
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ================= ENREGISTREMENT & MESSAGES MANQUÉS ================= */
+// Le vigile enregistre chaque prise de parole (stockée sur son appareil, 7 jours).
+// Quand un membre se (re)connecte, le vigile lui renvoie ce qu'il a manqué.
+let curCode = '', hostRec, hostRecorder;
+const MIME = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+const dbp = new Promise((ok, ko) => {
+  try {
+    const q = indexedDB.open('tw', 1);
+    q.onupgradeneeded = () => q.result.createObjectStore('msgs', { keyPath: 'id' });
+    q.onsuccess = () => ok(q.result); q.onerror = () => ko(q.error);
+  } catch (e) { ko(e); }
+});
+dbp.catch(() => {});
+async function dbPut(m) { try { const db = await dbp; return await new Promise(r => { const t = db.transaction('msgs', 'readwrite'); t.objectStore('msgs').put(m); t.oncomplete = r; t.onerror = r; }); } catch (e) {} }
+async function dbAll() { try { const db = await dbp; return await new Promise(r => { const q = db.transaction('msgs').objectStore('msgs').getAll(); q.onsuccess = () => r(q.result.sort((a, b) => a.ts - b.ts)); q.onerror = () => r([]); }); } catch (e) { return []; } }
+async function dbPrune() {
+  try { const db = await dbp; const old = (await dbAll()).filter(m => m.ts < Date.now() - 7 * 864e5);
+    const t = db.transaction('msgs', 'readwrite'); old.forEach(m => t.objectStore('msgs').delete(m.id)); } catch (e) {}
+}
+async function saveMsg(m) { m.ch = curCode; await dbPut(m); renderInbox(); }
+function setLast(ts) { try { const k = 'tw-last-' + curCode; localStorage.setItem(k, Math.max(ts, +localStorage.getItem(k) || 0)); } catch (e) {} }
+
+function startRec(stream) {
+  const r = new MediaRecorder(stream, MIME ? { mimeType: MIME } : undefined);
+  r._chunks = []; r._t0 = Date.now();
+  r.ondataavailable = e => e.data.size && r._chunks.push(e.data);
+  r.start(); return r;
+}
+function finishRec(r, from) {
+  setTimeout(() => {
+    if (!r || r.state === 'inactive') return;
+    r.onstop = async () => {
+      if (Date.now() - r._t0 < 800) return;            // ignore les clics trop courts
+      const blob = new Blob(r._chunks, { type: MIME || 'audio/webm' }), ts = Date.now();
+      await saveMsg({ id: ts + '-' + Math.random().toString(36).slice(2), from, ts, mime: blob.type, dur: ts - r._t0, blob });
+      members.forEach(m => m.conn && m.conn.open && m.conn.send({ t: 'seen', ts })); // ceux connectés l'ont entendu en direct
+    };
+    r.stop();
+  }, 400);
+}
+function recordMember(m, on) {
+  if (!m.recDest || !window.MediaRecorder) return;
+  if (on && !m.recorder) m.recorder = startRec(m.recDest.stream);
+  if (!on && m.recorder) { finishRec(m.recorder, m.name); m.recorder = null; }
+}
+function hostRecord(on) {
+  if (!hostRec || !window.MediaRecorder) return;
+  if (on && !hostRecorder) hostRecorder = startRec(hostRec.stream);
+  if (!on && hostRecorder) { finishRec(hostRecorder, myName); hostRecorder = null; }
+}
+async function sendMissed(conn, name, since) {
+  const missed = (await dbAll()).filter(x => x.ch === curCode && x.ts > (since || 0) && x.from !== name);
+  for (const x of missed) {
+    conn.send({ t: 'msg', id: x.id, from: x.from, ts: x.ts, mime: x.mime, dur: x.dur, buf: await x.blob.arrayBuffer() });
+  }
+}
+async function renderInbox() {
+  const list = (await dbAll()).filter(x => x.ch === curCode && x.from !== myName).slice(-30).reverse();
+  $('inboxTitle').textContent = '📨 Messages vocaux (' + list.length + ')';
+  const ul = $('inbox'); ul.innerHTML = '';
+  list.forEach(x => {
+    const d = new Date(x.ts), li = document.createElement('li');
+    li.innerHTML = `<span>${esc(x.from)} · ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ${Math.round(x.dur / 1000)}s</span>`;
+    const b = document.createElement('button'); b.textContent = '▶';
+    b.onclick = () => new Audio(URL.createObjectURL(x.blob)).play();
+    li.appendChild(b); ul.appendChild(li);
+  });
+}
+
+/* ================= VIGILE (hôte / relais) ================= */
+function getM(id) {
+  if (!members.has(id)) members.set(id, { name: '?', talking: false });
+  return members.get(id);
+}
+function roster() {
+  return [{ name: myName, talking }, ...[...members.values()].map(m => ({ name: m.name, talking: m.talking }))];
+}
+function broadcast() {
+  const list = roster();
+  members.forEach(m => m.conn && m.conn.open && m.conn.send({ t: 'list', list }));
+  renderRoster(list);
+}
+// Chaque membre reçoit un mix : voix du vigile + voix de tous les AUTRES membres
+function link(id) {
+  const n = members.get(id);
+  micGain.connect(n.dest);
+  members.forEach((o, oid) => {
+    if (oid === id || !o.src || !o.dest) return;
+    o.src.connect(n.dest);
+    n.src.connect(o.dest);
+  });
+}
+function drop(id) {
+  const m = members.get(id); if (!m) return;
+  try { m.src && m.src.disconnect(); } catch (e) {}
+  try { m.dest && m.dest.disconnect(); } catch (e) {}
+  members.delete(id); broadcast();
+}
+
+$('btnHost').onclick = async () => {
+  myName = $('name').value.trim() || 'Vigile'; role = 'host';
+  try { await getMic(); } catch (e) { return err('Accès au micro refusé.'); }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  micGain = ctx.createGain(); micGain.gain.value = 0;
+  ctx.createMediaStreamSource(mic).connect(micGain);
+  hostRec = ctx.createMediaStreamDestination(); micGain.connect(hostRec);
+
+  // le code est conservé pour que les membres retrouvent le même canal et leurs messages
+  let code = localStorage.getItem('tw-code') || Math.random().toString(36).slice(2, 8).toUpperCase();
+  localStorage.setItem('tw-code', code); curCode = code;
+  peer = new Peer(PREFIX + code);
+  peer.on('open', () => { $('chan').textContent = '🛡️ Code du canal : ' + code; show(); broadcast(); renderInbox(); dbPrune(); });
+  peer.on('error', e => err(e.type === 'unavailable-id' ? 'Ce canal est encore ouvert ailleurs, réessayez dans 1 minute.' : 'Erreur : ' + e.type));
+
+  peer.on('connection', conn => {
+    const m = getM(conn.peer); m.conn = conn;
+    conn.on('data', d => {
+      if (d.t === 'hello') { m.name = d.name; sendMissed(conn, d.name, d.since); }
+      if (d.t === 'talk') { m.talking = d.on; recordMember(m, d.on); }
+      broadcast();
+    });
+    conn.on('open', broadcast);
+    conn.on('close', () => drop(conn.peer));
+  });
+
+  peer.on('call', call => {
+    const m = getM(call.peer); m.call = call;
+    if (call.metadata && call.metadata.name) m.name = call.metadata.name;
+    m.dest = ctx.createMediaStreamDestination();
+    call.answer(m.dest.stream);
+    call.on('stream', s => {
+      m.audio = new Audio(); m.audio.srcObject = s; m.audio.muted = true; m.audio.play().catch(() => {}); // contournement Chrome
+      m.src = ctx.createMediaStreamSource(s);
+      m.src.connect(ctx.destination);      // le vigile entend le membre
+      m.recDest = ctx.createMediaStreamDestination(); m.src.connect(m.recDest); // pour l'enregistrement
+      link(call.peer);                     // et les autres aussi
+      broadcast();
+    });
+    call.on('close', () => drop(call.peer));
+  });
+};
+
+/* ================= MEMBRE ================= */
+$('btnJoin').onclick = async () => {
+  const code = $('code').value.trim().toUpperCase();
+  if (!code) return err('Entrez le code du canal.');
+  myName = $('name').value.trim() || 'Membre'; role = 'guest'; curCode = code;
+  try { await getMic(); } catch (e) { return err('Accès au micro refusé.'); }
+
+  peer = new Peer();
+  peer.on('error', e => err(e.type === 'peer-unavailable' ? 'Canal introuvable.' : 'Erreur : ' + e.type));
+  peer.on('open', () => {
+    const hostId = PREFIX + code;
+    hostConn = peer.connect(hostId, { reliable: true });
+    hostConn.on('open', () => hostConn.send({ t: 'hello', name: myName, since: +localStorage.getItem('tw-last-' + code) || Date.now() - 864e5 }));
+    hostConn.on('data', d => {
+      if (d.t === 'list') renderRoster(d.list);
+      if (d.t === 'seen') setLast(d.ts);
+      if (d.t === 'msg') { saveMsg({ id: d.id, from: d.from, ts: d.ts, mime: d.mime, dur: d.dur, blob: new Blob([d.buf], { type: d.mime }) }); setLast(d.ts); }
+    });
+    hostConn.on('close', () => { $('status').textContent = '⚠️ Canal fermé par le vigile'; });
+
+    const call = peer.call(hostId, mic, { metadata: { name: myName } });
+    call.on('stream', s => {
+      const a = $('player'); a.srcObject = s; a.play().catch(() => {});
+      $('chan').textContent = '📡 Canal ' + code; show(); renderInbox();
+    });
+    call.on('close', () => { $('status').textContent = '⚠️ Connexion perdue'; });
+  });
+};
+
+/* ================= PUSH-TO-TALK ================= */
+function setTalk(on) {
+  if (!mic || on === talking) return;
+  talking = on;
+  if (role === 'host') { micGain.gain.value = on ? 1 : 0; ctx.resume(); hostRecord(on); broadcast(); }
+  else {
+    mic.getAudioTracks()[0].enabled = on;
+    hostConn && hostConn.open && hostConn.send({ t: 'talk', on });
+  }
+  $('ptt').classList.toggle('on', on);
+  $('ptt').textContent = on ? '🔴 En train de parler' : 'Maintenir pour parler';
+}
+const ptt = $('ptt');
+ptt.addEventListener('pointerdown', e => { e.preventDefault(); if (!$('open').checked) setTalk(true); });
+['pointerup', 'pointerleave', 'pointercancel'].forEach(ev =>
+  ptt.addEventListener(ev, () => { if (!$('open').checked) setTalk(false); }));
+$('open').onchange = e => setTalk(e.target.checked);
+addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && !$('radio').hidden && !$('open').checked) { e.preventDefault(); setTalk(true); } });
+addEventListener('keyup', e => { if (e.code === 'Space' && !$('open').checked) setTalk(false); });
+</script>
+</body>
+</html>
